@@ -4,11 +4,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+onnx-embedder = []
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-uuid.workspace = true
+uuid = { workspace = true, features = ["v5"] }
 chrono.workspace = true
 foxstash-core = "0.3.1"
 parking_lot = "0.12"
