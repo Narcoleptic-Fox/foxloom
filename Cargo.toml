@@ -6,7 +6,7 @@ license.workspace = true
 
 [features]
 default = []
-onnx-embedder = []
+onnx-embedder = ["foxstash-core/onnx"]
 
 [dependencies]
 serde.workspace = true

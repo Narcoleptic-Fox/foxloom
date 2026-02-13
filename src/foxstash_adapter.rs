@@ -82,38 +82,41 @@ impl TextEmbedder for DeterministicEmbedder {
 
 #[cfg(feature = "onnx-embedder")]
 pub struct OnnxEmbedder {
-    embedding_dim: usize,
-    infer: Arc<dyn Fn(&str) -> Result<Vec<f32>, String> + Send + Sync>,
+    inner: Mutex<foxstash_core::embedding::OnnxEmbedder>,
 }
 
 #[cfg(feature = "onnx-embedder")]
 impl OnnxEmbedder {
-    pub fn from_infer_fn(
-        embedding_dim: usize,
-        infer: impl Fn(&str) -> Result<Vec<f32>, String> + Send + Sync + 'static,
-    ) -> Self {
-        Self {
-            embedding_dim,
-            infer: Arc::new(infer),
+    pub fn from_files(
+        model_path: impl AsRef<std::path::Path>,
+        tokenizer_path: impl AsRef<std::path::Path>,
+        ort_dylib_path: Option<std::path::PathBuf>,
+    ) -> Result<Self, String> {
+        if let Some(path) = ort_dylib_path {
+            foxstash_core::embedding::OnnxEmbedder::init_from(path)
+                .map_err(|e| format!("failed to initialize ONNX runtime: {e}"))?;
         }
+
+        let inner = foxstash_core::embedding::OnnxEmbedder::new(model_path, tokenizer_path)
+            .map_err(|e| format!("failed to create ONNX embedder: {e}"))?;
+        Ok(Self {
+            inner: Mutex::new(inner),
+        })
     }
 }
 
 #[cfg(feature = "onnx-embedder")]
 impl TextEmbedder for OnnxEmbedder {
     fn dimension(&self) -> usize {
-        self.embedding_dim
+        self.inner.lock().embedding_dim()
     }
 
     fn embed(&self, text: &str) -> Result<Vec<f32>, String> {
-        let mut vec = (self.infer)(text)?;
-        if vec.len() != self.embedding_dim {
-            return Err(format!(
-                "onnx embedder returned dim {}, expected {}",
-                vec.len(),
-                self.embedding_dim
-            ));
-        }
+        let mut vec = self
+            .inner
+            .lock()
+            .embed(text)
+            .map_err(|e| format!("onnx embedder inference failed: {e}"))?;
         normalize_vector(&mut vec);
         Ok(vec)
     }
@@ -139,12 +142,22 @@ impl FoxstashCoreAdapter {
     }
 
     #[cfg(feature = "onnx-embedder")]
-    pub fn with_onnx_infer_fn(
-        embedding_dim: usize,
-        infer: impl Fn(&str) -> Result<Vec<f32>, String> + Send + Sync + 'static,
-    ) -> Self {
-        let embedder = OnnxEmbedder::from_infer_fn(embedding_dim, infer);
-        Self::with_embedder(Arc::new(embedder))
+    pub fn try_from_onnx_files(
+        model_path: impl AsRef<std::path::Path>,
+        tokenizer_path: impl AsRef<std::path::Path>,
+        ort_dylib_path: Option<std::path::PathBuf>,
+    ) -> Result<Self, String> {
+        let embedder = OnnxEmbedder::from_files(model_path, tokenizer_path, ort_dylib_path)?;
+        Ok(Self::with_embedder(Arc::new(embedder)))
+    }
+
+    #[cfg(not(feature = "onnx-embedder"))]
+    pub fn try_from_onnx_files(
+        _model_path: impl AsRef<std::path::Path>,
+        _tokenizer_path: impl AsRef<std::path::Path>,
+        _ort_dylib_path: Option<std::path::PathBuf>,
+    ) -> Result<Self, String> {
+        Err("foxloom built without `onnx-embedder` feature".to_string())
     }
 }
 
