@@ -11,6 +11,11 @@ Hybrid memory layer with mem0-style semantics on top of `foxstash-core`.
 - `foxstash-core` adapter for embedding upsert/search/delete and snapshot rebuild
 - Optional ONNX embedder integration behind the `onnx-embedder` feature
 
+## Documentation
+
+- Start here: `docs/START-HERE.md`
+- Full docs index: `docs/README.md`
+
 ## Install
 
 ```toml
