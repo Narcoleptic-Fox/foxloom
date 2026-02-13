@@ -1,7 +1,9 @@
 pub mod adapter;
+pub mod foxstash_adapter;
 pub mod model;
 
 pub use adapter::FoxstashAdapter;
+pub use foxstash_adapter::FoxstashCoreAdapter;
 pub use model::{MemoryOp, MemoryRecord, MemoryScope, MemoryStatus, MemoryType};
 
 pub fn merge_candidate(existing: Option<&MemoryRecord>, candidate: &MemoryRecord) -> MemoryOp {
