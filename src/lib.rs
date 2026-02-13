@@ -3,6 +3,7 @@ pub mod context_builder;
 pub mod foxstash_adapter;
 pub mod model;
 pub mod scoring;
+pub mod store_manager;
 
 pub use adapter::FoxstashAdapter;
 pub use context_builder::{
@@ -14,6 +15,7 @@ pub use foxstash_adapter::OnnxEmbedder;
 pub use foxstash_adapter::{DeterministicEmbedder, FoxstashCoreAdapter, TextEmbedder};
 pub use model::{MemoryOp, MemoryRecord, MemoryScope, MemoryStatus, MemoryType};
 pub use scoring::{decayed_importance, DecayConfig};
+pub use store_manager::{MergeStats, RetrievalCandidate, ScopeQuery, StoreManager, StoreManagerConfig};
 
 pub fn merge_candidate(existing: Option<&MemoryRecord>, candidate: &MemoryRecord) -> MemoryOp {
     match existing {
@@ -212,3 +214,4 @@ mod tests {
         }
     }
 }
+
