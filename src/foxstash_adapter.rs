@@ -141,6 +141,46 @@ impl FoxstashCoreAdapter {
         }
     }
 
+    pub fn len(&self) -> usize {
+        self.index.lock().len()
+    }
+
+    pub fn snapshot_documents(&self) -> Vec<Document> {
+        self.index.lock().get_all_documents()
+    }
+
+    pub fn rebuild_from_documents(&self, documents: &[Document]) -> Result<(), String> {
+        let mut index = self.index.lock();
+        index.clear();
+        for doc in documents {
+            index
+                .add(doc.clone())
+                .map_err(|e| format!("foxstash restore failed: {e}"))?;
+        }
+        Ok(())
+    }
+
+    pub fn snapshot_records(&self) -> Vec<MemoryRecord> {
+        self.snapshot_documents()
+            .into_iter()
+            .map(document_to_memory_record)
+            .collect()
+    }
+
+    pub fn rebuild_from_records(&self, records: &[MemoryRecord]) -> Result<(), String> {
+        {
+            self.index.lock().clear();
+        }
+        for record in records {
+            self.upsert_embedding(
+                &record.memory_id.to_string(),
+                &record.text,
+                metadata_from_record(record),
+            )?;
+        }
+        Ok(())
+    }
+
     #[cfg(feature = "onnx-embedder")]
     pub fn try_from_onnx_files(
         model_path: impl AsRef<std::path::Path>,
@@ -254,14 +294,45 @@ fn normalize_document_metadata(key: &str, metadata: Value) -> Value {
 }
 
 fn result_to_memory_record(result: SearchResult) -> MemoryRecord {
-    let metadata = result.metadata.unwrap_or_else(|| Value::Object(Map::new()));
+    memory_record_from_parts(
+        &result.id,
+        &result.content,
+        result.metadata.as_ref(),
+        result.score,
+        Some(result.id.as_str()),
+    )
+}
+
+fn document_to_memory_record(document: Document) -> MemoryRecord {
+    memory_record_from_parts(
+        &document.id,
+        &document.content,
+        document.metadata.as_ref(),
+        0.7,
+        Some(document.id.as_str()),
+    )
+}
+
+fn memory_record_from_parts(
+    doc_id: &str,
+    content: &str,
+    metadata: Option<&Value>,
+    default_confidence: f32,
+    embedding_ref: Option<&str>,
+) -> MemoryRecord {
+    let metadata = metadata
+        .cloned()
+        .unwrap_or_else(|| Value::Object(Map::new()));
     let meta_obj = metadata.as_object();
+    let status_raw = meta_obj
+        .and_then(|m| m.get("status"))
+        .and_then(value_as_str);
 
     let memory_id = meta_obj
         .and_then(|m| m.get("memory_id"))
         .and_then(value_as_uuid)
-        .or_else(|| Uuid::parse_str(&result.id).ok())
-        .unwrap_or_else(|| Uuid::new_v5(&FALLBACK_UUID_NAMESPACE, result.id.as_bytes()));
+        .or_else(|| Uuid::parse_str(doc_id).ok())
+        .unwrap_or_else(|| Uuid::new_v5(&FALLBACK_UUID_NAMESPACE, doc_id.as_bytes()));
 
     let scope = meta_obj
         .and_then(|m| m.get("scope"))
@@ -273,15 +344,14 @@ fn result_to_memory_record(result: SearchResult) -> MemoryRecord {
         .and_then(value_as_str)
         .and_then(parse_memory_type)
         .unwrap_or(MemoryType::Episodic);
-    let status = meta_obj
-        .and_then(|m| m.get("status"))
-        .and_then(value_as_str)
-        .and_then(parse_status)
-        .unwrap_or(MemoryStatus::Active);
+    let status = match status_raw {
+        Some(raw) => parse_status(raw).unwrap_or(MemoryStatus::Quarantined),
+        None => MemoryStatus::Active,
+    };
     let confidence = meta_obj
         .and_then(|m| m.get("confidence"))
         .and_then(value_as_f32)
-        .unwrap_or(result.score)
+        .unwrap_or(default_confidence)
         .clamp(0.0, 1.0);
     let importance = meta_obj
         .and_then(|m| m.get("importance"))
@@ -312,15 +382,107 @@ fn result_to_memory_record(result: SearchResult) -> MemoryRecord {
             .map(str::to_string),
         scope,
         memory_type,
-        text: result.content,
+        text: content.to_string(),
         json_fields,
-        embedding_ref: Some(result.id),
+        embedding_ref: embedding_ref.map(str::to_string),
         confidence,
         importance,
         decay_half_life_hours,
         status,
         source_run_id,
     }
+}
+
+fn metadata_from_record(record: &MemoryRecord) -> Value {
+    Value::Object(Map::from_iter([
+        (
+            "memory_id".to_string(),
+            Value::String(record.memory_id.to_string()),
+        ),
+        (
+            "workspace_id".to_string(),
+            record
+                .workspace_id
+                .as_ref()
+                .map(|v| Value::String(v.clone()))
+                .unwrap_or(Value::Null),
+        ),
+        (
+            "user_id".to_string(),
+            record
+                .user_id
+                .as_ref()
+                .map(|v| Value::String(v.clone()))
+                .unwrap_or(Value::Null),
+        ),
+        (
+            "session_id".to_string(),
+            record
+                .session_id
+                .as_ref()
+                .map(|v| Value::String(v.clone()))
+                .unwrap_or(Value::Null),
+        ),
+        (
+            "scope".to_string(),
+            Value::String(
+                match record.scope {
+                    MemoryScope::User => "user",
+                    MemoryScope::Session => "session",
+                    MemoryScope::Workspace => "workspace",
+                    MemoryScope::Global => "global",
+                }
+                .to_string(),
+            ),
+        ),
+        (
+            "memory_type".to_string(),
+            Value::String(
+                match record.memory_type {
+                    MemoryType::Profile => "profile",
+                    MemoryType::Episodic => "episodic",
+                    MemoryType::Policy => "policy",
+                    MemoryType::ArtifactSummary => "artifact_summary",
+                }
+                .to_string(),
+            ),
+        ),
+        (
+            "status".to_string(),
+            Value::String(
+                match record.status {
+                    MemoryStatus::Active => "active",
+                    MemoryStatus::Superseded => "superseded",
+                    MemoryStatus::Quarantined => "quarantined",
+                    MemoryStatus::Deleted => "deleted",
+                }
+                .to_string(),
+            ),
+        ),
+        (
+            "confidence".to_string(),
+            Value::from(f64::from(record.confidence)),
+        ),
+        (
+            "importance".to_string(),
+            Value::from(f64::from(record.importance)),
+        ),
+        (
+            "decay_half_life_hours".to_string(),
+            record
+                .decay_half_life_hours
+                .map(|v| Value::from(u64::from(v)))
+                .unwrap_or(Value::Null),
+        ),
+        (
+            "source_run_id".to_string(),
+            record
+                .source_run_id
+                .map(|v| Value::String(v.to_string()))
+                .unwrap_or(Value::Null),
+        ),
+        ("json_fields".to_string(), record.json_fields.clone()),
+    ]))
 }
 
 fn extract_json_fields(meta_obj: Option<&Map<String, Value>>) -> Value {
@@ -398,6 +560,7 @@ fn parse_status(v: &str) -> Option<MemoryStatus> {
     match v {
         "active" => Some(MemoryStatus::Active),
         "superseded" => Some(MemoryStatus::Superseded),
+        "quarantined" => Some(MemoryStatus::Quarantined),
         "deleted" => Some(MemoryStatus::Deleted),
         _ => None,
     }
@@ -406,6 +569,7 @@ fn parse_status(v: &str) -> Option<MemoryStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::thread;
 
     #[test]
     fn adapter_search_returns_inserted_content() {
@@ -507,5 +671,146 @@ mod tests {
             .embed("foxloom deterministic vectors")
             .expect("embed");
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn invalid_status_is_quarantined_on_read() {
+        let adapter = FoxstashCoreAdapter::new(64);
+        let id = Uuid::new_v4().to_string();
+        adapter
+            .upsert_embedding(
+                &id,
+                "suspicious fact",
+                serde_json::json!({
+                    "scope": "session",
+                    "status": "nonsense"
+                }),
+            )
+            .expect("upsert");
+
+        let out = adapter
+            .similarity_search("suspicious", 3, None)
+            .expect("search");
+        assert!(!out.is_empty());
+        assert_eq!(out[0].status, MemoryStatus::Quarantined);
+    }
+
+    #[test]
+    fn metadata_filter_nested_object_matches() {
+        let adapter = FoxstashCoreAdapter::new(64);
+        let id = Uuid::new_v4().to_string();
+        adapter
+            .upsert_embedding(
+                &id,
+                "nested metadata",
+                serde_json::json!({
+                    "scope": "session",
+                    "json_fields": {"origin": "unit_test", "kind": {"tier": "gold"}}
+                }),
+            )
+            .expect("upsert");
+
+        let out = adapter
+            .similarity_search(
+                "nested metadata",
+                3,
+                Some(serde_json::json!({"json_fields": {"kind": {"tier": "gold"}}})),
+            )
+            .expect("search");
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn snapshot_and_rebuild_records_round_trip() {
+        let adapter = FoxstashCoreAdapter::new(64);
+        let id_a = Uuid::new_v4();
+        let id_b = Uuid::new_v4();
+        adapter
+            .upsert_embedding(
+                &id_a.to_string(),
+                "primary owner is atlas",
+                serde_json::json!({"scope":"session","memory_type":"policy","status":"active"}),
+            )
+            .expect("upsert a");
+        adapter
+            .upsert_embedding(
+                &id_b.to_string(),
+                "backup owner is apollo",
+                serde_json::json!({"scope":"session","memory_type":"policy","status":"superseded"}),
+            )
+            .expect("upsert b");
+
+        let snapshot = adapter.snapshot_records();
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(adapter.len(), 2);
+
+        adapter.rebuild_from_records(&snapshot).expect("rebuild");
+        assert_eq!(adapter.len(), 2);
+
+        let out = adapter
+            .similarity_search("owner", 5, Some(serde_json::json!({"scope":"session"})))
+            .expect("search");
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn concurrent_upsert_search_and_rebuild_soak() {
+        let adapter = Arc::new(FoxstashCoreAdapter::new(64));
+        let threads = 6usize;
+        let docs_per_thread = 80usize;
+
+        let mut joins = Vec::new();
+        for t in 0..threads {
+            let adapter = adapter.clone();
+            joins.push(thread::spawn(move || {
+                for i in 0..docs_per_thread {
+                    let id = Uuid::new_v4().to_string();
+                    let text = format!("soak memory t{} i{} owner atlas", t, i);
+                    adapter
+                        .upsert_embedding(
+                            &id,
+                            &text,
+                            serde_json::json!({
+                                "scope":"session",
+                                "memory_type":"episodic",
+                                "status":"active",
+                                "thread": t,
+                            }),
+                        )
+                        .expect("upsert");
+                    if i % 10 == 0 {
+                        let _ = adapter
+                            .similarity_search(
+                                "owner atlas",
+                                5,
+                                Some(serde_json::json!({"scope":"session","status":"active"})),
+                            )
+                            .expect("search");
+                    }
+                }
+            }));
+        }
+
+        for join in joins {
+            join.join().expect("join soak thread");
+        }
+
+        let expected = threads * docs_per_thread;
+        assert_eq!(adapter.len(), expected);
+
+        let snapshot = adapter.snapshot_records();
+        assert_eq!(snapshot.len(), expected);
+
+        adapter.rebuild_from_records(&snapshot).expect("rebuild");
+        assert_eq!(adapter.len(), expected);
+
+        let out = adapter
+            .similarity_search(
+                "owner atlas",
+                10,
+                Some(serde_json::json!({"scope":"session","status":"active"})),
+            )
+            .expect("search after rebuild");
+        assert!(!out.is_empty());
     }
 }
