@@ -12,10 +12,15 @@ pub use context_builder::{
 };
 #[cfg(feature = "onnx-embedder")]
 pub use foxstash_adapter::OnnxEmbedder;
-pub use foxstash_adapter::{DeterministicEmbedder, FoxstashCoreAdapter, TextEmbedder};
+pub use foxstash_adapter::{
+    DeterministicEmbedder, FoxstashCoreAdapter, PersistentConfig, PersistentFoxstashCoreAdapter,
+    TextEmbedder,
+};
 pub use model::{MemoryOp, MemoryRecord, MemoryScope, MemoryStatus, MemoryType};
 pub use scoring::{decayed_importance, DecayConfig};
-pub use store_manager::{MergeStats, RetrievalCandidate, ScopeQuery, StoreManager, StoreManagerConfig};
+pub use store_manager::{
+    MergeStats, RetrievalCandidate, ScopeQuery, StoreManager, StoreManagerConfig,
+};
 
 pub fn merge_candidate(existing: Option<&MemoryRecord>, candidate: &MemoryRecord) -> MemoryOp {
     match existing {
@@ -214,4 +219,3 @@ mod tests {
         }
     }
 }
-

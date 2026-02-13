@@ -1,9 +1,19 @@
-use std::{cmp::Ordering, collections::HashSet, sync::Arc};
+use std::{
+    cmp::Ordering,
+    collections::{HashMap, HashSet},
+    path::Path,
+    sync::Arc,
+};
 
 use foxstash_core::index::HNSWIndex;
+use foxstash_core::storage::incremental::{
+    IncrementalConfig, IncrementalStorage, IndexMetadata, RecoveryHelper, StorageStats,
+    WalOperation,
+};
 use foxstash_core::Document;
 use foxstash_core::SearchResult;
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use uuid::Uuid;
 
@@ -637,11 +647,360 @@ fn parse_status(v: &str) -> Option<MemoryStatus> {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct PersistentConfig {
+    pub incremental: IncrementalConfig,
+    pub delete_compaction_threshold: usize,
+}
+
+impl Default for PersistentConfig {
+    fn default() -> Self {
+        Self {
+            incremental: IncrementalConfig::default(),
+            delete_compaction_threshold: 512,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedDocument {
+    id: String,
+    content: String,
+    embedding: Vec<f32>,
+    metadata_json: Option<String>,
+}
+
+impl PersistedDocument {
+    fn from_document(doc: &Document) -> Result<Self, String> {
+        let metadata_json = match &doc.metadata {
+            Some(meta) => Some(
+                serde_json::to_string(meta)
+                    .map_err(|e| format!("serialize metadata for checkpoint failed: {e}"))?,
+            ),
+            None => None,
+        };
+        Ok(Self {
+            id: doc.id.clone(),
+            content: doc.content.clone(),
+            embedding: doc.embedding.clone(),
+            metadata_json,
+        })
+    }
+
+    fn into_document(self) -> Result<Document, String> {
+        let metadata = match self.metadata_json {
+            Some(raw) => Some(
+                serde_json::from_str(&raw)
+                    .map_err(|e| format!("parse checkpoint metadata failed: {e}"))?,
+            ),
+            None => None,
+        };
+        Ok(Document {
+            id: self.id,
+            content: self.content,
+            embedding: self.embedding,
+            metadata,
+        })
+    }
+}
+
+fn encode_wal_content(text: &str, metadata: Option<&Value>) -> Result<String, String> {
+    let payload = serde_json::json!({
+        "v": 1,
+        "text": text,
+        "metadata": metadata.cloned().unwrap_or(Value::Null),
+    });
+    serde_json::to_string(&payload).map_err(|e| format!("encode WAL payload failed: {e}"))
+}
+
+fn decode_wal_document(mut doc: Document) -> Result<Document, String> {
+    let parsed: Value = serde_json::from_str(&doc.content)
+        .map_err(|e| format!("decode WAL payload failed: {e}"))?;
+    if parsed.get("v").and_then(Value::as_u64) != Some(1) {
+        return Err("unsupported WAL payload version".to_string());
+    }
+    if let Some(text) = parsed.get("text").and_then(Value::as_str) {
+        doc.content = text.to_string();
+    }
+    let metadata = parsed.get("metadata").cloned().unwrap_or(Value::Null);
+    doc.metadata = if metadata.is_null() {
+        None
+    } else {
+        Some(metadata)
+    };
+    Ok(doc)
+}
+#[derive(Clone)]
+pub struct PersistentFoxstashCoreAdapter {
+    inner: FoxstashCoreAdapter,
+    storage: Arc<Mutex<IncrementalStorage>>,
+    active_docs: Arc<Mutex<HashMap<String, Document>>>,
+    delete_count_since_compaction: Arc<Mutex<usize>>,
+    config: PersistentConfig,
+}
+
+impl PersistentFoxstashCoreAdapter {
+    pub fn new(
+        embedding_dim: usize,
+        base_path: impl AsRef<Path>,
+        config: PersistentConfig,
+    ) -> Result<Self, String> {
+        Self::with_embedder_and_storage(
+            Arc::new(DeterministicEmbedder::new(embedding_dim)),
+            base_path,
+            config,
+        )
+    }
+
+    pub fn with_embedder_and_storage(
+        embedder: Arc<dyn TextEmbedder>,
+        base_path: impl AsRef<Path>,
+        config: PersistentConfig,
+    ) -> Result<Self, String> {
+        let inner = FoxstashCoreAdapter::with_embedder(embedder);
+        let storage = IncrementalStorage::new(base_path, config.incremental.clone())
+            .map_err(|e| format!("foxstash incremental open failed: {e}"))?;
+        let adapter = Self {
+            inner,
+            storage: Arc::new(Mutex::new(storage)),
+            active_docs: Arc::new(Mutex::new(HashMap::new())),
+            delete_count_since_compaction: Arc::new(Mutex::new(0)),
+            config,
+        };
+        adapter.recover()?;
+        Ok(adapter)
+    }
+
+    #[cfg(feature = "onnx-embedder")]
+    pub fn try_from_onnx_files(
+        model_path: impl AsRef<Path>,
+        tokenizer_path: impl AsRef<Path>,
+        ort_dylib_path: Option<std::path::PathBuf>,
+        base_path: impl AsRef<Path>,
+        config: PersistentConfig,
+    ) -> Result<Self, String> {
+        let embedder = Arc::new(OnnxEmbedder::from_files(
+            model_path,
+            tokenizer_path,
+            ort_dylib_path,
+        )?);
+        Self::with_embedder_and_storage(embedder, base_path, config)
+    }
+
+    fn recover(&self) -> Result<(), String> {
+        let mut docs_by_id = HashMap::<String, Document>::new();
+        {
+            let storage = self.storage.lock();
+            if let Some((checkpoint_docs, _meta)) = storage
+                .load_checkpoint::<Vec<PersistedDocument>>()
+                .map_err(|e| format!("foxstash load checkpoint failed: {e}"))?
+            {
+                for persisted in checkpoint_docs {
+                    let doc = persisted.into_document()?;
+                    docs_by_id.insert(doc.id.clone(), doc);
+                }
+            }
+
+            let helper = RecoveryHelper::new(&storage);
+            helper
+                .replay_wal(|op| {
+                    match op {
+                        WalOperation::Add(doc) => {
+                            let decoded = decode_wal_document(doc.clone())
+                                .map_err(foxstash_core::RagError::StorageError)?;
+                            docs_by_id.insert(decoded.id.clone(), decoded);
+                        }
+                        WalOperation::Remove(id) => {
+                            docs_by_id.remove(id);
+                        }
+                        WalOperation::Clear => {
+                            docs_by_id.clear();
+                        }
+                        WalOperation::Checkpoint { .. } => {}
+                    }
+                    Ok(())
+                })
+                .map_err(|e| format!("foxstash WAL replay failed: {e}"))?;
+        }
+
+        let docs = docs_by_id.values().cloned().collect::<Vec<_>>();
+        self.inner.rebuild_from_documents(&docs)?;
+        *self.active_docs.lock() = docs_by_id;
+        *self.delete_count_since_compaction.lock() = 0;
+        Ok(())
+    }
+
+    pub fn storage_stats(&self) -> StorageStats {
+        self.storage.lock().stats()
+    }
+
+    pub fn force_checkpoint(&self) -> Result<(), String> {
+        self.checkpoint_if_needed(true)
+    }
+
+    pub fn sync(&self) -> Result<(), String> {
+        self.storage
+            .lock()
+            .sync()
+            .map_err(|e| format!("foxstash WAL sync failed: {e}"))
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    fn checkpoint_if_needed(&self, force: bool) -> Result<(), String> {
+        let docs = self
+            .active_docs
+            .lock()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let persisted = docs
+            .iter()
+            .map(PersistedDocument::from_document)
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut storage = self.storage.lock();
+        if !force && !storage.needs_checkpoint() {
+            return Ok(());
+        }
+        let meta = IndexMetadata {
+            document_count: docs.len(),
+            embedding_dim: self.inner.embedder.dimension(),
+            index_type: "hnsw".to_string(),
+        };
+        storage
+            .checkpoint(&persisted, meta)
+            .map_err(|e| format!("foxstash checkpoint failed: {e}"))?;
+        Ok(())
+    }
+
+    fn compact_if_needed(&self) -> Result<(), String> {
+        let delete_count = *self.delete_count_since_compaction.lock();
+        if delete_count < self.config.delete_compaction_threshold {
+            return Ok(());
+        }
+
+        let docs = self
+            .active_docs
+            .lock()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        self.inner.rebuild_from_documents(&docs)?;
+        *self.delete_count_since_compaction.lock() = 0;
+        self.checkpoint_if_needed(true)
+    }
+}
+
+impl FoxstashAdapter for PersistentFoxstashCoreAdapter {
+    fn upsert_embedding(&self, key: &str, text: &str, metadata: Value) -> Result<(), String> {
+        let embedding = self.inner.embedder.embed(text)?;
+        let normalized = normalize_document_metadata(key, metadata);
+        let doc = Document {
+            id: key.to_string(),
+            content: text.to_string(),
+            embedding,
+            metadata: Some(normalized),
+        };
+        let wal_doc = Document {
+            id: doc.id.clone(),
+            content: encode_wal_content(&doc.content, doc.metadata.as_ref())?,
+            embedding: doc.embedding.clone(),
+            metadata: None,
+        };
+
+        {
+            self.storage
+                .lock()
+                .log_add(&wal_doc)
+                .map_err(|e| format!("foxstash WAL add failed: {e}"))?;
+        }
+
+        {
+            self.inner
+                .index
+                .lock()
+                .add(doc.clone())
+                .map_err(|e| format!("foxstash add failed: {e}"))?;
+            self.inner.tombstones.lock().remove(key);
+        }
+        self.active_docs.lock().insert(key.to_string(), doc);
+        self.checkpoint_if_needed(false)
+    }
+
+    fn delete_embedding(&self, key: &str) -> Result<(), String> {
+        {
+            self.storage
+                .lock()
+                .log_remove(key)
+                .map_err(|e| format!("foxstash WAL remove failed: {e}"))?;
+        }
+        self.inner.tombstones.lock().insert(key.to_string());
+        self.active_docs.lock().remove(key);
+        *self.delete_count_since_compaction.lock() += 1;
+        self.compact_if_needed()?;
+        self.checkpoint_if_needed(false)
+    }
+
+    fn similarity_search(
+        &self,
+        query: &str,
+        top_k: usize,
+        metadata_filter: Option<Value>,
+    ) -> Result<Vec<MemoryRecord>, String> {
+        self.inner.similarity_search(query, top_k, metadata_filter)
+    }
+
+    fn batch_upsert_embeddings(&self, items: &[(String, String, Value)]) -> Result<(), String> {
+        let mut docs = Vec::with_capacity(items.len());
+        for (key, text, metadata) in items {
+            let embedding = self.inner.embedder.embed(text)?;
+            let normalized = normalize_document_metadata(key, metadata.clone());
+            docs.push(Document {
+                id: key.clone(),
+                content: text.clone(),
+                embedding,
+                metadata: Some(normalized),
+            });
+        }
+
+        {
+            let mut storage = self.storage.lock();
+            for doc in &docs {
+                let wal_doc = Document {
+                    id: doc.id.clone(),
+                    content: encode_wal_content(&doc.content, doc.metadata.as_ref())?,
+                    embedding: doc.embedding.clone(),
+                    metadata: None,
+                };
+                storage
+                    .log_add(&wal_doc)
+                    .map_err(|e| format!("foxstash WAL add failed: {e}"))?;
+            }
+        }
+
+        {
+            let mut index = self.inner.index.lock();
+            let mut tombstones = self.inner.tombstones.lock();
+            let mut active = self.active_docs.lock();
+            for doc in docs {
+                index
+                    .add(doc.clone())
+                    .map_err(|e| format!("foxstash add failed: {e}"))?;
+                tombstones.remove(&doc.id);
+                active.insert(doc.id.clone(), doc);
+            }
+        }
+        self.checkpoint_if_needed(false)
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::Utc;
     use std::thread;
+    use tempfile::TempDir;
 
     struct FlakyEmbedder;
 
@@ -1019,5 +1378,74 @@ mod tests {
             1,
             "failed rebuild must not clear or partially replace existing index"
         );
+    }
+    #[test]
+    fn persistent_adapter_recovers_from_wal_reopen() {
+        let dir = TempDir::new().expect("tempdir");
+        let cfg = PersistentConfig {
+            incremental: IncrementalConfig::default().with_checkpoint_threshold(10_000),
+            delete_compaction_threshold: 10_000,
+        };
+        {
+            let adapter = PersistentFoxstashCoreAdapter::new(64, dir.path(), cfg.clone())
+                .expect("persistent new");
+            let a = Uuid::new_v4().to_string();
+            let b = Uuid::new_v4().to_string();
+            adapter
+                .upsert_embedding(
+                    &a,
+                    "owner is atlas",
+                    serde_json::json!({"scope":"session","status":"active"}),
+                )
+                .expect("upsert a");
+            adapter
+                .upsert_embedding(
+                    &b,
+                    "owner is zeus",
+                    serde_json::json!({"scope":"session","status":"active"}),
+                )
+                .expect("upsert b");
+            adapter.delete_embedding(&a).expect("delete a");
+            adapter.sync().expect("sync");
+        }
+
+        let reopened = PersistentFoxstashCoreAdapter::new(64, dir.path(), cfg).expect("reopen");
+        let out = reopened
+            .similarity_search(
+                "owner",
+                5,
+                Some(serde_json::json!({"scope":"session","status":"active"})),
+            )
+            .expect("search after reopen");
+        assert_eq!(out.len(), 1);
+        assert!(out[0].text.contains("zeus"));
+    }
+
+    #[test]
+    fn persistent_adapter_exposes_checkpoint_stats() {
+        let dir = TempDir::new().expect("tempdir");
+        let cfg = PersistentConfig {
+            incremental: IncrementalConfig::default().with_checkpoint_threshold(2),
+            delete_compaction_threshold: 10_000,
+        };
+        let adapter =
+            PersistentFoxstashCoreAdapter::new(32, dir.path(), cfg).expect("persistent new");
+
+        for _ in 0..3 {
+            adapter
+                .upsert_embedding(
+                    &Uuid::new_v4().to_string(),
+                    "checkpoint me",
+                    serde_json::json!({"scope":"session","status":"active"}),
+                )
+                .expect("upsert");
+        }
+
+        let stats = adapter.storage_stats();
+        assert!(
+            stats.checkpoint_id.is_some(),
+            "expected checkpoint after threshold"
+        );
+        assert!(stats.total_documents >= 2);
     }
 }

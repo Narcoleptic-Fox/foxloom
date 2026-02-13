@@ -12,4 +12,11 @@ pub trait FoxstashAdapter: Send + Sync {
         top_k: usize,
         metadata_filter: Option<Value>,
     ) -> Result<Vec<MemoryRecord>, String>;
+
+    fn batch_upsert_embeddings(&self, items: &[(String, String, Value)]) -> Result<(), String> {
+        for (key, text, metadata) in items {
+            self.upsert_embedding(key, text, metadata.clone())?;
+        }
+        Ok(())
+    }
 }

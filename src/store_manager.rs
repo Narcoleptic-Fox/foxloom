@@ -227,8 +227,15 @@ mod tests {
     use super::*;
 
     fn record(id: u128, scope: MemoryScope, text: &str, entity: Option<&str>) -> MemoryRecord {
-        let mut r = MemoryRecord::new(Uuid::from_u128(id), scope, MemoryType::Policy, text.to_string());
-        r.json_fields = entity.map(|e| json!({"entity": e})).unwrap_or(serde_json::Value::Null);
+        let mut r = MemoryRecord::new(
+            Uuid::from_u128(id),
+            scope,
+            MemoryType::Policy,
+            text.to_string(),
+        );
+        r.json_fields = entity
+            .map(|e| json!({"entity": e}))
+            .unwrap_or(serde_json::Value::Null);
         r
     }
 
@@ -246,8 +253,19 @@ mod tests {
     #[test]
     fn merge_prefers_workspace_over_global_for_same_entity() {
         let mgr = StoreManager::new(StoreManagerConfig { top_k: 8 });
-        let global = candidate(record(1, MemoryScope::Global, "owner is team atlas", Some("owner")), 0.95);
-        let workspace = candidate(record(2, MemoryScope::Workspace, "owner is team zeus", Some("owner")), 0.80);
+        let global = candidate(
+            record(1, MemoryScope::Global, "owner is team atlas", Some("owner")),
+            0.95,
+        );
+        let workspace = candidate(
+            record(
+                2,
+                MemoryScope::Workspace,
+                "owner is team zeus",
+                Some("owner"),
+            ),
+            0.80,
+        );
 
         let (merged, stats) = mgr.merge_scoped_candidates(vec![global, workspace]);
         assert_eq!(merged.len(), 1);
@@ -274,7 +292,12 @@ mod tests {
             workspace_id: Some("wa".to_string()),
             user_id: Some("u1".to_string()),
         };
-        let mut other_ws = record(11, MemoryScope::Workspace, "owner is team zeus", Some("owner"));
+        let mut other_ws = record(
+            11,
+            MemoryScope::Workspace,
+            "owner is team zeus",
+            Some("owner"),
+        );
         other_ws.workspace_id = Some("wb".to_string());
         assert!(!mgr.scope_allows(&scope, &other_ws));
 
@@ -283,5 +306,3 @@ mod tests {
         assert!(mgr.scope_allows(&scope, &global));
     }
 }
-
-
