@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -25,6 +26,7 @@ pub enum MemoryType {
 pub enum MemoryStatus {
     Active,
     Superseded,
+    Quarantined,
     Deleted,
 }
 
@@ -44,6 +46,7 @@ pub struct MemoryRecord {
     pub decay_half_life_hours: Option<u32>,
     pub status: MemoryStatus,
     pub source_run_id: Option<Uuid>,
+    pub updated_at: DateTime<Utc>,
 }
 
 impl MemoryRecord {
@@ -63,6 +66,7 @@ impl MemoryRecord {
             decay_half_life_hours: None,
             status: MemoryStatus::Active,
             source_run_id: None,
+            updated_at: Utc::now(),
         }
     }
 }

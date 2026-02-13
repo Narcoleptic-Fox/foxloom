@@ -1,4 +1,4 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{cmp::Ordering, collections::HashSet, sync::Arc};
 
 use foxstash_core::index::HNSWIndex;
 use foxstash_core::Document;
@@ -12,8 +12,9 @@ use crate::{FoxstashAdapter, MemoryRecord, MemoryScope, MemoryStatus, MemoryType
 const FALLBACK_UUID_NAMESPACE: Uuid = Uuid::from_bytes([
     0x84, 0x34, 0x5a, 0x26, 0x3b, 0xa7, 0x4f, 0xb0, 0x88, 0x26, 0x95, 0x5f, 0x6d, 0x65, 0x60, 0xcf,
 ]);
+const OVERFETCH_CAP_MULTIPLIER: usize = 8;
 
-const RESERVED_METADATA_KEYS: [&str; 12] = [
+const RESERVED_METADATA_KEYS: [&str; 13] = [
     "memory_id",
     "workspace_id",
     "user_id",
@@ -25,6 +26,7 @@ const RESERVED_METADATA_KEYS: [&str; 12] = [
     "importance",
     "decay_half_life_hours",
     "source_run_id",
+    "updated_at",
     "json_fields",
 ];
 
@@ -250,15 +252,26 @@ impl FoxstashAdapter for FoxstashCoreAdapter {
             return Ok(vec![]);
         }
         let tombstones = self.tombstones.lock().clone();
+        let max_fetch = top_k
+            .saturating_mul(OVERFETCH_CAP_MULTIPLIER)
+            .max(1)
+            .min(total);
 
-        let mut fetch_k = top_k.max(1).min(total);
+        let mut fetch_k = top_k.max(1).min(max_fetch);
         let mut out = Vec::new();
         loop {
-            let results = self
+            let mut results = self
                 .index
                 .lock()
                 .search(&query_embedding, fetch_k)
                 .map_err(|e| format!("foxstash search failed: {e}"))?;
+            results.sort_by(|left, right| {
+                right
+                    .score
+                    .partial_cmp(&left.score)
+                    .unwrap_or(Ordering::Equal)
+                    .then_with(|| left.id.cmp(&right.id))
+            });
             out.clear();
             let mut seen_ids = HashSet::new();
             for result in results {
@@ -283,10 +296,14 @@ impl FoxstashAdapter for FoxstashCoreAdapter {
                     break;
                 }
             }
-            if out.len() >= top_k || fetch_k >= total {
+            if out.len() >= top_k || fetch_k >= max_fetch {
                 break;
             }
-            fetch_k = (fetch_k.saturating_mul(2)).min(total);
+            let next_fetch = (fetch_k.saturating_mul(2)).min(max_fetch);
+            if next_fetch == fetch_k {
+                break;
+            }
+            fetch_k = next_fetch;
         }
         out.truncate(top_k);
 
@@ -407,6 +424,12 @@ fn memory_record_from_parts(
     let source_run_id = meta_obj
         .and_then(|m| m.get("source_run_id"))
         .and_then(value_as_uuid);
+    let updated_at = meta_obj
+        .and_then(|m| m.get("updated_at"))
+        .and_then(value_as_str)
+        .and_then(|v| chrono::DateTime::parse_from_rfc3339(v).ok())
+        .map(|v| v.with_timezone(&chrono::Utc))
+        .unwrap_or_else(chrono::Utc::now);
     let json_fields = extract_json_fields(meta_obj);
 
     MemoryRecord {
@@ -433,6 +456,7 @@ fn memory_record_from_parts(
         decay_half_life_hours,
         status,
         source_run_id,
+        updated_at,
     }
 }
 
@@ -524,6 +548,10 @@ fn metadata_from_record(record: &MemoryRecord) -> Value {
                 .map(|v| Value::String(v.to_string()))
                 .unwrap_or(Value::Null),
         ),
+        (
+            "updated_at".to_string(),
+            Value::String(record.updated_at.to_rfc3339()),
+        ),
         ("json_fields".to_string(), record.json_fields.clone()),
     ]))
 }
@@ -612,6 +640,7 @@ fn parse_status(v: &str) -> Option<MemoryStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
     use std::thread;
 
     struct FlakyEmbedder;
@@ -980,6 +1009,7 @@ mod tests {
             decay_half_life_hours: None,
             status: MemoryStatus::Active,
             source_run_id: None,
+            updated_at: Utc::now(),
         });
 
         let err = adapter.rebuild_from_records(&bad_records);

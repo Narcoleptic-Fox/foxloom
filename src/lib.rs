@@ -1,12 +1,19 @@
 pub mod adapter;
+pub mod context_builder;
 pub mod foxstash_adapter;
 pub mod model;
+pub mod scoring;
 
 pub use adapter::FoxstashAdapter;
+pub use context_builder::{
+    build_active_context, build_active_context_with_estimator, BudgetEstimator, BuiltContext,
+    ContextBudget, ContextBuildConfig, ContextItem, WordBudgetEstimator,
+};
 #[cfg(feature = "onnx-embedder")]
 pub use foxstash_adapter::OnnxEmbedder;
 pub use foxstash_adapter::{DeterministicEmbedder, FoxstashCoreAdapter, TextEmbedder};
 pub use model::{MemoryOp, MemoryRecord, MemoryScope, MemoryStatus, MemoryType};
+pub use scoring::{decayed_importance, DecayConfig};
 
 pub fn merge_candidate(existing: Option<&MemoryRecord>, candidate: &MemoryRecord) -> MemoryOp {
     match existing {
