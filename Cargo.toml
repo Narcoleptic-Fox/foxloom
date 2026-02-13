@@ -2,8 +2,16 @@
 name = "foxloom"
 version = "0.2.0"
 edition = "2021"
+rust-version = "1.80"
 license = "MIT"
-description = "Hybrid memory layer with mem0-style semantics on foxstash-core"
+description = "Hybrid memory layer with mem0-style semantics on top of foxstash-core"
+readme = "README.md"
+repository = "https://github.com/Narcoleptic-Fox/foxloom"
+homepage = "https://github.com/Narcoleptic-Fox/foxloom"
+documentation = "https://docs.rs/foxloom"
+keywords = ["memory", "rag", "vector", "agent", "foxstash"]
+categories = ["database", "text-processing"]
+exclude = [".models/*"]
 
 [features]
 default = []
