@@ -4,6 +4,7 @@ use crate::MemoryRecord;
 
 pub trait FoxstashAdapter: Send + Sync {
     fn upsert_embedding(&self, key: &str, text: &str, metadata: Value) -> Result<(), String>;
+    fn delete_embedding(&self, key: &str) -> Result<(), String>;
 
     fn similarity_search(
         &self,

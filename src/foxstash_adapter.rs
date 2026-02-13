@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use foxstash_core::index::HNSWIndex;
 use foxstash_core::Document;
@@ -125,6 +125,7 @@ impl TextEmbedder for OnnxEmbedder {
 #[derive(Clone)]
 pub struct FoxstashCoreAdapter {
     index: Arc<Mutex<HNSWIndex>>,
+    tombstones: Arc<Mutex<HashSet<String>>>,
     embedder: Arc<dyn TextEmbedder>,
 }
 
@@ -137,6 +138,7 @@ impl FoxstashCoreAdapter {
         let embedding_dim = embedder.dimension();
         Self {
             index: Arc::new(Mutex::new(HNSWIndex::with_defaults(embedding_dim))),
+            tombstones: Arc::new(Mutex::new(HashSet::new())),
             embedder,
         }
     }
@@ -150,13 +152,18 @@ impl FoxstashCoreAdapter {
     }
 
     pub fn rebuild_from_documents(&self, documents: &[Document]) -> Result<(), String> {
-        let mut index = self.index.lock();
-        index.clear();
+        let embedding_dim = self.embedder.dimension();
+        let mut rebuilt = HNSWIndex::with_defaults(embedding_dim);
         for doc in documents {
-            index
+            rebuilt
                 .add(doc.clone())
                 .map_err(|e| format!("foxstash restore failed: {e}"))?;
         }
+        {
+            let mut index = self.index.lock();
+            *index = rebuilt;
+        }
+        self.tombstones.lock().clear();
         Ok(())
     }
 
@@ -168,17 +175,20 @@ impl FoxstashCoreAdapter {
     }
 
     pub fn rebuild_from_records(&self, records: &[MemoryRecord]) -> Result<(), String> {
-        {
-            self.index.lock().clear();
-        }
+        let mut docs = Vec::with_capacity(records.len());
         for record in records {
-            self.upsert_embedding(
-                &record.memory_id.to_string(),
-                &record.text,
-                metadata_from_record(record),
-            )?;
+            let embedding = self.embedder.embed(&record.text)?;
+            docs.push(Document {
+                id: record.memory_id.to_string(),
+                content: record.text.clone(),
+                embedding,
+                metadata: Some(normalize_document_metadata(
+                    &record.memory_id.to_string(),
+                    metadata_from_record(record),
+                )),
+            });
         }
-        Ok(())
+        self.rebuild_from_documents(&docs)
     }
 
     #[cfg(feature = "onnx-embedder")]
@@ -215,7 +225,14 @@ impl FoxstashAdapter for FoxstashCoreAdapter {
         self.index
             .lock()
             .add(doc)
-            .map_err(|e| format!("foxstash add failed: {e}"))
+            .map_err(|e| format!("foxstash add failed: {e}"))?;
+        self.tombstones.lock().remove(key);
+        Ok(())
+    }
+
+    fn delete_embedding(&self, key: &str) -> Result<(), String> {
+        self.tombstones.lock().insert(key.to_string());
+        Ok(())
     }
 
     fn similarity_search(
@@ -224,28 +241,54 @@ impl FoxstashAdapter for FoxstashCoreAdapter {
         top_k: usize,
         metadata_filter: Option<Value>,
     ) -> Result<Vec<MemoryRecord>, String> {
+        if top_k == 0 {
+            return Ok(vec![]);
+        }
         let query_embedding = self.embedder.embed(query)?;
-        let results = self
-            .index
-            .lock()
-            .search(&query_embedding, top_k)
-            .map_err(|e| format!("foxstash search failed: {e}"))?;
+        let total = self.index.lock().len();
+        if total == 0 {
+            return Ok(vec![]);
+        }
+        let tombstones = self.tombstones.lock().clone();
 
+        let mut fetch_k = top_k.max(1).min(total);
         let mut out = Vec::new();
-        for result in results {
-            let metadata_value = result
-                .metadata
-                .clone()
-                .unwrap_or_else(|| Value::Object(Map::new()));
-
-            if let Some(filter) = &metadata_filter {
-                if !metadata_matches(&metadata_value, filter) {
+        loop {
+            let results = self
+                .index
+                .lock()
+                .search(&query_embedding, fetch_k)
+                .map_err(|e| format!("foxstash search failed: {e}"))?;
+            out.clear();
+            let mut seen_ids = HashSet::new();
+            for result in results {
+                if tombstones.contains(&result.id) {
                     continue;
                 }
-            }
+                if !seen_ids.insert(result.id.clone()) {
+                    continue;
+                }
+                let metadata_value = result
+                    .metadata
+                    .clone()
+                    .unwrap_or_else(|| Value::Object(Map::new()));
 
-            out.push(result_to_memory_record(result));
+                if let Some(filter) = &metadata_filter {
+                    if !metadata_matches(&metadata_value, filter) {
+                        continue;
+                    }
+                }
+                out.push(result_to_memory_record(result));
+                if out.len() >= top_k {
+                    break;
+                }
+            }
+            if out.len() >= top_k || fetch_k >= total {
+                break;
+            }
+            fetch_k = (fetch_k.saturating_mul(2)).min(total);
         }
+        out.truncate(top_k);
 
         Ok(out)
     }
@@ -571,6 +614,21 @@ mod tests {
     use super::*;
     use std::thread;
 
+    struct FlakyEmbedder;
+
+    impl TextEmbedder for FlakyEmbedder {
+        fn dimension(&self) -> usize {
+            8
+        }
+
+        fn embed(&self, text: &str) -> Result<Vec<f32>, String> {
+            if text.contains("FAIL_EMBED") {
+                return Err("forced embed failure".to_string());
+            }
+            Ok(vec![1.0; 8])
+        }
+    }
+
     #[test]
     fn adapter_search_returns_inserted_content() {
         let adapter = FoxstashCoreAdapter::new(64);
@@ -812,5 +870,124 @@ mod tests {
             )
             .expect("search after rebuild");
         assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn delete_embedding_tombstones_results_and_upsert_clears_tombstone() {
+        let adapter = FoxstashCoreAdapter::new(64);
+        let id = Uuid::new_v4().to_string();
+        adapter
+            .upsert_embedding(
+                &id,
+                "team atlas owns service",
+                serde_json::json!({"scope":"session","status":"active"}),
+            )
+            .expect("upsert");
+
+        let before = adapter
+            .similarity_search(
+                "owns service",
+                5,
+                Some(serde_json::json!({"scope":"session","status":"active"})),
+            )
+            .expect("search before delete");
+        assert_eq!(before.len(), 1);
+
+        adapter.delete_embedding(&id).expect("delete embedding");
+        let deleted = adapter
+            .similarity_search(
+                "owns service",
+                5,
+                Some(serde_json::json!({"scope":"session","status":"active"})),
+            )
+            .expect("search after delete");
+        assert!(deleted.is_empty(), "tombstoned embeddings must be hidden");
+
+        adapter
+            .upsert_embedding(
+                &id,
+                "team atlas owns service",
+                serde_json::json!({"scope":"session","status":"active"}),
+            )
+            .expect("re-upsert");
+        let restored = adapter
+            .similarity_search(
+                "owns service",
+                5,
+                Some(serde_json::json!({"scope":"session","status":"active"})),
+            )
+            .expect("search after re-upsert");
+        assert_eq!(restored.len(), 1);
+    }
+
+    #[test]
+    fn search_overfetches_past_filtered_top_k() {
+        let adapter = FoxstashCoreAdapter::new(64);
+        for i in 0..40 {
+            let id = Uuid::new_v4().to_string();
+            adapter
+                .upsert_embedding(
+                    &id,
+                    "shared query corpus owner",
+                    serde_json::json!({"scope":"session","status":"active","bucket":"all"}),
+                )
+                .expect("upsert");
+            if i < 35 {
+                adapter.delete_embedding(&id).expect("tombstone");
+            }
+        }
+
+        let out = adapter
+            .similarity_search(
+                "owner",
+                5,
+                Some(serde_json::json!({"scope":"session","status":"active"})),
+            )
+            .expect("search");
+        assert_eq!(
+            out.len(),
+            5,
+            "search should widen beyond initial top_k to find non-filtered records"
+        );
+    }
+
+    #[test]
+    fn rebuild_from_records_is_atomic_on_embedding_failure() {
+        let adapter = FoxstashCoreAdapter::with_embedder(Arc::new(FlakyEmbedder));
+        adapter
+            .upsert_embedding(
+                &Uuid::new_v4().to_string(),
+                "stable baseline record",
+                serde_json::json!({"scope":"session","status":"active"}),
+            )
+            .expect("seed baseline");
+        let baseline = adapter.snapshot_records();
+        assert_eq!(baseline.len(), 1);
+
+        let mut bad_records = baseline.clone();
+        bad_records.push(MemoryRecord {
+            memory_id: Uuid::new_v4(),
+            workspace_id: None,
+            user_id: None,
+            session_id: Some("s".to_string()),
+            scope: MemoryScope::Session,
+            memory_type: MemoryType::Episodic,
+            text: "FAIL_EMBED trigger".to_string(),
+            json_fields: Value::Null,
+            embedding_ref: None,
+            confidence: 0.7,
+            importance: 0.5,
+            decay_half_life_hours: None,
+            status: MemoryStatus::Active,
+            source_run_id: None,
+        });
+
+        let err = adapter.rebuild_from_records(&bad_records);
+        assert!(err.is_err(), "expected forced embedding failure");
+        assert_eq!(
+            adapter.len(),
+            1,
+            "failed rebuild must not clear or partially replace existing index"
+        );
     }
 }
