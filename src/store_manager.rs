@@ -7,11 +7,19 @@ use crate::{MemoryRecord, MemoryScope};
 #[derive(Debug, Clone)]
 pub struct StoreManagerConfig {
     pub top_k: usize,
+    /// When `true`, attempt to extract entity keys from record text (splitting on
+    /// `" is "` or `":"`) when `json_fields.entity` is not set. This heuristic can
+    /// produce false positives (e.g. `"This is a good policy"` → entity `"This"`),
+    /// so it is disabled by default. Prefer setting `json_fields.entity` explicitly.
+    pub text_entity_extraction: bool,
 }
 
 impl Default for StoreManagerConfig {
     fn default() -> Self {
-        Self { top_k: 8 }
+        Self {
+            top_k: 8,
+            text_entity_extraction: false,
+        }
     }
 }
 
@@ -79,7 +87,7 @@ impl StoreManager {
         let mut filtered = 0usize;
 
         for candidate in by_id.into_values() {
-            if let Some(entity) = normalized_entity_key(&candidate.record) {
+            if let Some(entity) = normalized_entity_key(&candidate.record, self.config.text_entity_extraction) {
                 by_entity.entry(entity).or_default().push(candidate);
             } else {
                 kept.push(mark_non_conflicting(candidate));
@@ -169,7 +177,7 @@ fn scope_rank(scope: &MemoryScope) -> usize {
     }
 }
 
-fn normalized_entity_key(record: &MemoryRecord) -> Option<String> {
+fn normalized_entity_key(record: &MemoryRecord, text_extraction: bool) -> Option<String> {
     if let Some(entity) = record
         .json_fields
         .get("entity")
@@ -180,7 +188,11 @@ fn normalized_entity_key(record: &MemoryRecord) -> Option<String> {
         return Some(normalize_entity_text(entity));
     }
 
-    extract_entity_from_text(&record.text).map(normalize_entity_text)
+    if text_extraction {
+        return extract_entity_from_text(&record.text).map(normalize_entity_text);
+    }
+
+    None
 }
 
 fn extract_entity_from_text(text: &str) -> Option<&str> {
@@ -245,7 +257,7 @@ mod tests {
 
     #[test]
     fn merge_prefers_workspace_over_global_for_same_entity() {
-        let mgr = StoreManager::new(StoreManagerConfig { top_k: 8 });
+        let mgr = StoreManager::new(StoreManagerConfig { top_k: 8, ..Default::default() });
         let global = candidate(record(1, MemoryScope::Global, "owner is team atlas", Some("owner")), 0.95);
         let workspace = candidate(record(2, MemoryScope::Workspace, "owner is team zeus", Some("owner")), 0.80);
 
@@ -258,7 +270,7 @@ mod tests {
 
     #[test]
     fn merge_uses_uuid_tiebreaker_deterministically() {
-        let mgr = StoreManager::new(StoreManagerConfig { top_k: 8 });
+        let mgr = StoreManager::new(StoreManagerConfig { top_k: 8, ..Default::default() });
         let a = candidate(record(1, MemoryScope::Session, "a", None), 1.0);
         let b = candidate(record(2, MemoryScope::Session, "b", None), 1.0);
         let (merged, _) = mgr.merge_scoped_candidates(vec![b, a]);
@@ -268,7 +280,7 @@ mod tests {
 
     #[test]
     fn scope_filter_blocks_cross_workspace_leakage() {
-        let mgr = StoreManager::new(StoreManagerConfig { top_k: 8 });
+        let mgr = StoreManager::new(StoreManagerConfig { top_k: 8, ..Default::default() });
         let scope = ScopeQuery {
             session_id: "s1".to_string(),
             workspace_id: Some("wa".to_string()),
