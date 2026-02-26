@@ -22,7 +22,74 @@ pub use store_manager::{
     MergeStats, RetrievalCandidate, ScopeQuery, StoreManager, StoreManagerConfig,
 };
 
+// MergeConfig is defined in this file (lib.rs) and exported directly.
+
+/// Configuration for merge behavior.
+#[derive(Debug, Clone)]
+pub struct MergeConfig {
+    /// Minimum confidence gap required to reject a candidate via `Noop`.
+    ///
+    /// A candidate is rejected when `candidate.confidence + supersede_threshold < current.confidence`.
+    /// Lower values make supersede easier; higher values protect established memories.
+    ///
+    /// Default: `0.05`
+    pub supersede_threshold: f32,
+}
+
+impl Default for MergeConfig {
+    fn default() -> Self {
+        Self {
+            supersede_threshold: 0.05,
+        }
+    }
+}
+
+/// Determine the merge operation for a candidate memory against an optional existing record.
+///
+/// Uses default [`MergeConfig`]. See [`merge_candidate_with_config`] for custom thresholds.
+///
+/// # Decision tree
+///
+/// 1. **No existing record** → `Add`
+/// 2. **Exact text match** → `Update` metadata (confidence/importance) or `Noop` if identical
+/// 3. **Scope or type mismatch** → `Add` (different category, no conflict)
+/// 4. **Existing not active** → `Add` (don't conflict with archived memories)
+/// 5. **Candidate not active** → `Noop` (don't overwrite active with non-active)
+/// 6. **Different entity** → `Add` (no conflict between unrelated facts)
+/// 7. **Same entity, candidate confidence too low** → `Noop`
+/// 8. **Same entity, sufficient confidence** → `Supersede`
+///
+/// # Entity detection
+///
+/// Entities are matched via `json_fields.entity`. If neither record has an entity set,
+/// they are treated as non-conflicting (step 6 → `Add`).
+///
+/// # Examples
+///
+/// ```
+/// use foxloom::{merge_candidate, MemoryRecord, MemoryScope, MemoryType, MemoryOp};
+/// use uuid::Uuid;
+///
+/// // Adding a new memory (no existing)
+/// let candidate = MemoryRecord::new(
+///     Uuid::new_v4(), MemoryScope::Session, MemoryType::Episodic,
+///     "deploy succeeded".to_string(),
+/// );
+/// let op = merge_candidate(None, &candidate);
+/// assert!(matches!(op, MemoryOp::Add { .. }));
+/// ```
 pub fn merge_candidate(existing: Option<&MemoryRecord>, candidate: &MemoryRecord) -> MemoryOp {
+    merge_candidate_with_config(existing, candidate, &MergeConfig::default())
+}
+
+/// Determine the merge operation with a custom [`MergeConfig`].
+///
+/// See [`merge_candidate`] for the decision tree and semantics.
+pub fn merge_candidate_with_config(
+    existing: Option<&MemoryRecord>,
+    candidate: &MemoryRecord,
+    config: &MergeConfig,
+) -> MemoryOp {
     match existing {
         None => MemoryOp::Add {
             record: candidate.clone(),
@@ -83,7 +150,7 @@ pub fn merge_candidate(existing: Option<&MemoryRecord>, candidate: &MemoryRecord
                 };
             }
 
-            if candidate.confidence + 0.05 < current.confidence {
+            if candidate.confidence + config.supersede_threshold < current.confidence {
                 return MemoryOp::Noop {
                     memory_id: current.memory_id,
                     reason: "lower_confidence_candidate".to_string(),
