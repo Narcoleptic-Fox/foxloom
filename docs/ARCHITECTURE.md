@@ -6,7 +6,7 @@
 - `src/scoring.rs`: recency decay scoring.
 - `src/context_builder.rs`: deterministic budgeted context formatting.
 - `src/adapter.rs`: vector adapter trait contract.
-- `src/foxstash_adapter.rs`: `foxstash-core` adapter implementation.
+- `src/foxstash_adapter.rs`: `foxstash-core` adapter implementation and persistent adapter.
 - `src/lib.rs`: public exports and merge entrypoint.
 
 ## High-Level Components
@@ -19,28 +19,36 @@ graph TD
     A --> E[foxloom::context_builder]
     A --> F[foxloom::adapter trait]
     F --> G[foxloom::FoxstashCoreAdapter]
+    F --> I[foxloom::PersistentFoxstashCoreAdapter]
     G --> H[foxstash-core HNSWIndex]
+    I --> G
+    I --> J[foxstash-core IncrementalStorage]
+    J --> K[WAL / Checkpoints]
 ```
 
-## Typical Runtime Data Path
+## Typical Runtime Data Path (Persistent)
 
 ```mermaid
 sequenceDiagram
     participant App as Engine/App
-    participant Adapter as FoxstashCoreAdapter
+    participant PAdapter as PersistentFoxstashCoreAdapter
+    participant Storage as IncrementalStorage
     participant Index as HNSWIndex
-    participant Scoring as scoring
-    participant Builder as context_builder
 
-    App->>Adapter: similarity_search(query, top_k)
-    Adapter->>Index: search(embedding, fetch_k)
-    Index-->>Adapter: SearchResult[]
-    Adapter-->>App: MemoryRecord[]
-    App->>Scoring: decayed_importance(...)
-    Scoring-->>App: effective_importance
-    App->>Builder: build_active_context(...)
-    Builder-->>App: BuiltContext
+    App->>PAdapter: upsert_embedding(key, text, meta)
+    PAdapter->>Storage: log_add(wal_doc)
+    PAdapter->>Index: add(doc)
+    PAdapter->>PAdapter: checkpoint_if_needed()
+    Storage-->>PAdapter: WAL sync
+    PAdapter-->>App: Result
 ```
+
+## Persistence Design
+
+- **WAL (Write-Ahead Log)**: Every modification is logged to disk before being applied to the in-memory HNSW index.
+- **Checkpoints**: The entire active document set is periodically serialized to a checkpoint file, allowing the WAL to be truncated.
+- **Recovery**: On startup, the adapter loads the latest checkpoint and replays any subsequent WAL entries to restore the index state.
+- **Compaction**: Deletions in HNSW are handled via tombstones. The persistent adapter automatically rebuilds the index from active documents once a deletion threshold is met.
 
 ## Determinism Guarantees
 

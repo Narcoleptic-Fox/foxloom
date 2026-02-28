@@ -10,6 +10,7 @@ This guide gets you productive in under 15 minutes.
 - Merge semantics for add/update/supersede/noop decisions.
 - Decay scoring (`decayed_importance`) for recency-aware ranking.
 - Deterministic active context builder under strict budget.
+- Reliable **Persistence** with WAL and recovery support.
 - A `foxstash-core` adapter for vector upsert/search/delete.
 
 ## Quick Install
@@ -26,7 +27,32 @@ Optional ONNX embedder support:
 foxloom = { version = "0.2", features = ["onnx-embedder"] }
 ```
 
-## Minimal End-to-End Example
+## Persistent Storage Example
+
+For production use cases, use the `PersistentFoxstashCoreAdapter` to ensure memories survive application restarts.
+
+```rust
+use foxloom::{PersistentFoxstashCoreAdapter, PersistentConfig, FoxstashAdapter};
+use std::path::Path;
+
+let storage_path = "./memory_db";
+let config = PersistentConfig::default();
+
+// Initialize or recover from path
+let adapter = PersistentFoxstashCoreAdapter::new(384, storage_path, config)
+    .expect("failed to open memory store");
+
+adapter.upsert_embedding(
+    "id-123",
+    "The user prefers dark mode",
+    serde_json::json!({"scope": "user", "memory_type": "profile"})
+).expect("save failed");
+
+// Ensure data is synced to disk
+adapter.sync().expect("sync failed");
+```
+
+## Minimal End-to-End Example (Logic)
 
 ```rust
 use foxloom::{

@@ -1,6 +1,6 @@
 # Retrieval And Context
 
-## Adapter Retrieval (`FoxstashCoreAdapter`)
+## Adapter Retrieval (`FoxstashCoreAdapter` & `PersistentFoxstashCoreAdapter`)
 
 `similarity_search(query, top_k, metadata_filter)`:
 
@@ -9,6 +9,17 @@
 - Applies tombstones and metadata filter.
 - Deduplicates IDs and maps records from metadata.
 - Stops when enough records are found or cap reached.
+
+### Persistent Recovery
+
+The `PersistentFoxstashCoreAdapter` ensures that retrieval results are consistent across restarts by replaying the Write-Ahead Log (WAL) and loading the latest checkpoint into the HNSW index on initialization.
+
+### Batch Operations
+
+`batch_upsert_embeddings(items)`:
+
+- Allows for high-throughput memory insertion.
+- In the persistent adapter, this performs multiple WAL logs before updating the in-memory index, reducing I/O overhead.
 
 ### Retrieval Widening
 
